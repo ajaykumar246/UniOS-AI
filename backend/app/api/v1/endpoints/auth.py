@@ -6,11 +6,13 @@ from app.schemas.auth import (
     RegisterRequest,
     LoginRequest,
     ResendVerificationRequest,
+    EmailStatusRequest,
     ForgotPasswordRequest,
     ResetPasswordRequest,
     MFAVerifyRequest,
     SocialLoginRequest,
-    MFAEnrollVerifyRequest
+    MFAEnrollVerifyRequest,
+    CallbackRequest
 )
 from app.core.supabase_api import supabase_auth_api
 from app.core.supabase import supabase_admin
@@ -25,7 +27,8 @@ async def register(request: RegisterRequest):
             email=request.email,
             password=request.password,
             full_name=request.full_name,
-            terms_accepted=request.terms_accepted
+            terms_accepted=request.terms_accepted,
+            redirect_to=request.redirect_to
         )
         return {
             "message": "Registration successful. Please check your email to verify your account.",
@@ -34,24 +37,37 @@ async def register(request: RegisterRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.get("/verify-email")
-async def verify_email(token: str, email: str):
+@router.post("/resend-verification")
+async def resend_verification(request: ResendVerificationRequest):
     try:
-        res = await supabase_auth_api.verify_otp(email=email, token=token, type="signup")
+        await supabase_auth_api.resend_verification(request.email, redirect_to=request.redirect_to)
+        return {"message": "Verification email resent successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/check-email-status")
+async def check_email_status(request: EmailStatusRequest):
+    try:
+        is_verified = False
+        res = supabase_admin.table("users").select("email, email_confirmed_at").eq("email", request.email).execute()
+        if res.data and res.data[0].get("email_confirmed_at"):
+            is_verified = True
+        else:
+            try:
+                users_list = supabase_admin.auth.admin.list_users()
+                target = next((u for u in users_list if getattr(u, "email", None) == request.email), None)
+                if target and getattr(target, "email_confirmed_at", None):
+                    is_verified = True
+            except Exception:
+                pass
+
         return {
-            "message": "Email verified successfully.",
-            "session": res.get("session")
+            "email": request.email,
+            "is_verified": is_verified
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.post("/resend-verification")
-async def resend_verification(request: ResendVerificationRequest):
-    try:
-        await supabase_auth_api.resend_verification(request.email)
-        return {"message": "Verification email resent successfully."}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/login")
 async def login(request: LoginRequest):
@@ -113,6 +129,13 @@ async def login(request: LoginRequest):
         }
 
     except Exception as e:
+        err_msg = str(e)
+        if "email not confirmed" in err_msg.lower() or "unverified" in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Email not verified. Please verify your email before logging in."
+            )
+
         # Increment failed login attempts
         if profile:
             attempts = profile.get("failed_login_attempts", 0) + 1
@@ -133,10 +156,38 @@ async def social_login(request: SocialLoginRequest):
     if request.provider not in ("google", "github", "facebook"):
         raise HTTPException(status_code=400, detail="Unsupported social provider")
     
-    redirect_to = request.redirect_to or "http://localhost:3000/callback"
+    redirect_to = request.redirect_to or "http://localhost:8000/api/v1/auth/callback"
     # Construct PKCE authorization URL for Supabase Auth redirect
     url = f"{supabase_admin.supabase_url}/auth/v1/authorize?provider={request.provider}&redirect_to={redirect_to}"
     return {"url": url}
+
+@router.get("/callback")
+@router.post("/callback")
+async def callback(
+    code: str | None = None,
+    code_verifier: str | None = None,
+    request_body: CallbackRequest | None = None
+):
+    auth_code = code or (request_body.code if request_body else None)
+    verifier = code_verifier or (request_body.code_verifier if request_body else None)
+
+    if not auth_code:
+        raise HTTPException(status_code=400, detail="Missing required authorization code")
+
+    try:
+        session_data = await supabase_auth_api.exchange_code_for_session(auth_code, verifier)
+        return {
+            "message": "Authentication successful",
+            "session": {
+                "access_token": session_data.get("access_token"),
+                "refresh_token": session_data.get("refresh_token"),
+                "expires_in": session_data.get("expires_in"),
+                "token_type": session_data.get("token_type", "bearer")
+            },
+            "user": session_data.get("user")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/mfa/verify")
 async def mfa_verify(request: MFAVerifyRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):

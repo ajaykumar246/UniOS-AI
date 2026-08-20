@@ -17,17 +17,21 @@ class SupabaseAuthAPI:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
-    async def sign_up(self, email: str, password: str, full_name: str, terms_accepted: bool) -> dict:
+    async def sign_up(self, email: str, password: str, full_name: str, terms_accepted: bool, redirect_to: str | None = None) -> dict:
         url = f"{settings.SUPABASE_URL}/auth/v1/signup"
+        options = {
+            "data": {
+                "full_name": full_name,
+                "terms_accepted": terms_accepted
+            }
+        }
+        if redirect_to:
+            options["email_redirect_to"] = redirect_to
+
         body = {
             "email": email,
             "password": password,
-            "options": {
-                "data": {
-                    "full_name": full_name,
-                    "terms_accepted": terms_accepted
-                }
-            }
+            "options": options
         }
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=body, headers=self._get_headers())
@@ -46,21 +50,27 @@ class SupabaseAuthAPI:
             response = await client.post(url, json=body, headers=self._get_headers())
             if response.status_code != 200:
                 raise Exception(response.json().get("msg", "OTP verification failed"))
-            return response.json()
-
-    async def resend_verification(self, email: str) -> dict:
+    async def resend_verification(self, email: str, redirect_to: str | None = None) -> dict:
         url = f"{settings.SUPABASE_URL}/auth/v1/resend"
+        options = {}
+        if redirect_to:
+            options["email_redirect_to"] = redirect_to
+
         body = {
             "email": email,
             "type": "signup"
         }
+        if options:
+            body["options"] = options
+
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=body, headers=self._get_headers())
             if response.status_code != 200:
-                raise Exception(response.json().get("msg", "Resend verification failed"))
+                raise Exception(response.json().get("msg", response.json().get("error_description", "Resend verification failed")))
             return response.json()
 
     async def sign_in(self, email: str, password: str) -> dict:
+
         url = f"{settings.SUPABASE_URL}/auth/v1/token?grant_type=password"
         body = {
             "email": email,
@@ -136,6 +146,20 @@ class SupabaseAuthAPI:
             response = await client.post(url, json=body, headers=self._get_headers(token))
             if response.status_code != 200:
                 raise Exception(response.json().get("msg", "MFA verification failed"))
+            return response.json()
+
+    async def exchange_code_for_session(self, auth_code: str, code_verifier: str | None = None) -> dict:
+        url = f"{settings.SUPABASE_URL}/auth/v1/token?grant_type=pkce_code"
+        body = {
+            "auth_code": auth_code
+        }
+        if code_verifier:
+            body["code_verifier"] = code_verifier
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=body, headers=self._get_headers())
+            if response.status_code != 200:
+                raise Exception(response.json().get("error_description", response.json().get("msg", "Code exchange failed")))
             return response.json()
 
 supabase_auth_api = SupabaseAuthAPI()

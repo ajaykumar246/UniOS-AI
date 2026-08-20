@@ -63,24 +63,69 @@ async def test_register_success(mock_supabase_api):
         email="john@example.com",
         password="SecurePassword123!",
         full_name="John Doe",
-        terms_accepted=True
+        terms_accepted=True,
+        redirect_to=None
     )
-
-# --- EMAIL VERIFICATION TESTS ---
 
 @pytest.mark.asyncio
-async def test_verify_email_success(mock_supabase_api):
-    mock_supabase_api.verify_otp = AsyncMock(return_value={"session": {"access_token": "token-123"}})
-    response = client.get("/api/v1/auth/verify-email?token=otp-token&email=john@example.com")
-    assert response.status_code == 200
-    assert "Email verified successfully" in response.json()["message"]
-    mock_supabase_api.verify_otp.assert_called_once_with(
+async def test_register_success_with_redirect_to(mock_supabase_api):
+    mock_supabase_api.sign_up = AsyncMock(return_value={"user": {"id": "user-uuid-123", "email": "john@example.com"}})
+    payload = {
+        "full_name": "John Doe",
+        "email": "john@example.com",
+        "password": "SecurePassword123!",
+        "terms_accepted": True,
+        "redirect_to": "http://localhost:3000/auth/callback"
+    }
+    response = client.post("/api/v1/auth/register", json=payload)
+    assert response.status_code == 201
+    assert "Registration successful" in response.json()["message"]
+    mock_supabase_api.sign_up.assert_called_once_with(
         email="john@example.com",
-        token="otp-token",
-        type="signup"
+        password="SecurePassword123!",
+        full_name="John Doe",
+        terms_accepted=True,
+        redirect_to="http://localhost:3000/auth/callback"
     )
 
+
+
+# --- RESEND VERIFICATION & EMAIL STATUS TESTS ---
+
+@pytest.mark.asyncio
+async def test_resend_verification_success(mock_supabase_api):
+    mock_supabase_api.resend_verification = AsyncMock(return_value={})
+    payload = {"email": "john@example.com", "redirect_to": "http://localhost:3000/auth/callback"}
+    response = client.post("/api/v1/auth/resend-verification", json=payload)
+    assert response.status_code == 200
+    assert "Verification email resent successfully" in response.json()["message"]
+    mock_supabase_api.resend_verification.assert_called_once_with("john@example.com", redirect_to="http://localhost:3000/auth/callback")
+
+@pytest.mark.asyncio
+async def test_check_email_status_verified(mock_supabase_admin):
+    mock_db_res = MagicMock()
+    mock_db_res.data = [{"email": "john@example.com", "email_confirmed_at": "2026-08-20T12:00:00Z"}]
+    mock_supabase_admin.table.return_value.select.return_value.eq.return_value.execute.return_value = mock_db_res
+
+    payload = {"email": "john@example.com"}
+    response = client.post("/api/v1/auth/check-email-status", json=payload)
+    assert response.status_code == 200
+    assert response.json()["is_verified"] is True
+
+@pytest.mark.asyncio
+async def test_login_unverified_email(mock_supabase_api, mock_supabase_admin):
+    mock_db_res = MagicMock()
+    mock_db_res.data = [{"user_id": "user-uuid-123", "failed_login_attempts": 0, "account_locked_until": None}]
+    mock_supabase_admin.table.return_value.select.return_value.eq.return_value.execute.return_value = mock_db_res
+
+    mock_supabase_api.sign_in = AsyncMock(side_effect=Exception("Email not confirmed"))
+    payload = {"email": "unverified@example.com", "password": "SecurePassword123!"}
+    response = client.post("/api/v1/auth/login", json=payload)
+    assert response.status_code == 403
+    assert "Email not verified" in response.json()["detail"]
+
 # --- LOGIN & LOCKOUT TESTS ---
+
 
 @pytest.mark.asyncio
 async def test_login_success(mock_supabase_api, mock_supabase_admin):
@@ -254,5 +299,51 @@ async def test_mfa_verify_success(mock_supabase_api, mock_supabase_admin):
         challenge_id="challenge-uuid-123",
         code="123456"
     )
+
+# --- OAUTH / CALLBACK TESTS ---
+
+@pytest.mark.asyncio
+async def test_callback_get_success(mock_supabase_api):
+    mock_supabase_api.exchange_code_for_session = AsyncMock(return_value={
+        "access_token": "oauth-jwt-access",
+        "refresh_token": "oauth-jwt-refresh",
+        "expires_in": 3600,
+        "token_type": "bearer",
+        "user": {"id": "user-uuid-123", "email": "social@example.com"}
+    })
+    response = client.get("/api/v1/auth/callback?code=pkce_code_123")
+    assert response.status_code == 200
+    assert response.json()["message"] == "Authentication successful"
+    assert response.json()["session"]["access_token"] == "oauth-jwt-access"
+    mock_supabase_api.exchange_code_for_session.assert_called_once_with("pkce_code_123", None)
+
+@pytest.mark.asyncio
+async def test_callback_post_success(mock_supabase_api):
+    mock_supabase_api.exchange_code_for_session = AsyncMock(return_value={
+        "access_token": "oauth-jwt-access",
+        "refresh_token": "oauth-jwt-refresh",
+        "expires_in": 3600,
+        "token_type": "bearer",
+        "user": {"id": "user-uuid-123", "email": "social@example.com"}
+    })
+    payload = {"code": "pkce_code_123", "code_verifier": "verifier_xyz"}
+    response = client.post("/api/v1/auth/callback", json=payload)
+    assert response.status_code == 200
+    assert response.json()["message"] == "Authentication successful"
+    assert response.json()["session"]["access_token"] == "oauth-jwt-access"
+    mock_supabase_api.exchange_code_for_session.assert_called_once_with("pkce_code_123", "verifier_xyz")
+
+def test_callback_missing_code():
+    response = client.get("/api/v1/auth/callback")
+    assert response.status_code == 400
+    assert "Missing required authorization code" in response.json()["detail"]
+
+@pytest.mark.asyncio
+async def test_callback_failure(mock_supabase_api):
+    mock_supabase_api.exchange_code_for_session = AsyncMock(side_effect=Exception("Invalid authorization code"))
+    response = client.get("/api/v1/auth/callback?code=invalid_code")
+    assert response.status_code == 400
+    assert "Invalid authorization code" in response.json()["detail"]
+
 
 
