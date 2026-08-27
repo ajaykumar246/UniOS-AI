@@ -12,36 +12,49 @@ from app.schemas.auth import (
     MFAVerifyRequest,
     SocialLoginRequest,
     MFAEnrollVerifyRequest,
-    CallbackRequest
+    CallbackRequest,
+    RefreshTokenRequest
 )
 from app.core.supabase_api import supabase_auth_api
 from app.core.supabase import supabase_admin
+from app.core.deps import validate_redirect_url
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 security = HTTPBearer()
 
+# Default Redirect Paths (Configurable)
+DEFAULT_AUTH_CALLBACK_PATH = "/auth/callback"
+DEFAULT_RESET_PASSWORD_PATH = "/reset-password"
+
+
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(request: RegisterRequest):
     try:
+        redirect_url = validate_redirect_url(None, default_path=DEFAULT_AUTH_CALLBACK_PATH)
         res = await supabase_auth_api.sign_up(
             email=request.email,
             password=request.password,
             full_name=request.full_name,
             terms_accepted=request.terms_accepted,
-            redirect_to=request.redirect_to
+            redirect_to=redirect_url
         )
         return {
             "message": "Registration successful. Please check your email to verify your account.",
             "user": res.get("user")
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/resend-verification")
 async def resend_verification(request: ResendVerificationRequest):
     try:
-        await supabase_auth_api.resend_verification(request.email, redirect_to=request.redirect_to)
+        redirect_url = validate_redirect_url(None, default_path=DEFAULT_AUTH_CALLBACK_PATH)
+        await supabase_auth_api.resend_verification(request.email, redirect_to=redirect_url)
         return {"message": "Verification email resent successfully."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -49,14 +62,12 @@ async def resend_verification(request: ResendVerificationRequest):
 async def check_email_status(request: EmailStatusRequest):
     try:
         is_verified = False
-        res = supabase_admin.table("users").select("email, email_confirmed_at").eq("email", request.email).execute()
-        if res.data and res.data[0].get("email_confirmed_at"):
-            is_verified = True
-        else:
+        res = supabase_admin.table("users").select("user_id").eq("email", request.email).execute()
+        if res.data:
+            user_id = res.data[0].get("user_id")
             try:
-                users_list = supabase_admin.auth.admin.list_users()
-                target = next((u for u in users_list if getattr(u, "email", None) == request.email), None)
-                if target and getattr(target, "email_confirmed_at", None):
+                admin_res = supabase_admin.auth.admin.get_user_by_id(user_id)
+                if admin_res and getattr(admin_res.user, "email_confirmed_at", None):
                     is_verified = True
             except Exception:
                 pass
@@ -156,7 +167,7 @@ async def social_login(request: SocialLoginRequest):
     if request.provider not in ("google", "github", "facebook"):
         raise HTTPException(status_code=400, detail="Unsupported social provider")
     
-    redirect_to = request.redirect_to or "http://localhost:8000/api/v1/auth/callback"
+    redirect_to = validate_redirect_url(None, default_path=DEFAULT_AUTH_CALLBACK_PATH)
     # Construct PKCE authorization URL for Supabase Auth redirect
     url = f"{supabase_admin.supabase_url}/auth/v1/authorize?provider={request.provider}&redirect_to={redirect_to}"
     return {"url": url}
@@ -240,8 +251,7 @@ async def mfa_verify_enroll(request: MFAEnrollVerifyRequest, credentials: HTTPAu
         # Update public.users record
         # Extract user_id from token
         from jose import jwt
-        from app.core.config import settings
-        payload = jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        payload = jwt.get_unverified_claims(token)
         user_id = payload.get("sub")
         
         if user_id:
@@ -254,8 +264,11 @@ async def mfa_verify_enroll(request: MFAEnrollVerifyRequest, credentials: HTTPAu
 @router.post("/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest):
     try:
-        await supabase_auth_api.forgot_password(request.email)
+        redirect_url = validate_redirect_url(None, default_path=DEFAULT_RESET_PASSWORD_PATH)
+        await supabase_auth_api.forgot_password(request.email, redirect_to=redirect_url)
         return {"message": "Password recovery email has been sent."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -265,6 +278,21 @@ async def reset_password(request: ResetPasswordRequest, credentials: HTTPAuthori
     try:
         await supabase_auth_api.update_password(token, request.new_password)
         return {"message": "Password has been reset successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/refresh")
+async def refresh_session(request: RefreshTokenRequest):
+    try:
+        session_data = await supabase_auth_api.refresh_token(request.refresh_token)
+        return {
+            "session": {
+                "access_token": session_data.get("access_token"),
+                "refresh_token": session_data.get("refresh_token"),
+                "expires_in": session_data.get("expires_in"),
+                "token_type": session_data.get("token_type", "bearer")
+            }
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

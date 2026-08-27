@@ -82,8 +82,10 @@ class SupabaseAuthAPI:
                 raise Exception(response.json().get("error_description", "Invalid login credentials"))
             return response.json()
 
-    async def forgot_password(self, email: str) -> dict:
+    async def forgot_password(self, email: str, redirect_to: str | None = None) -> dict:
         url = f"{settings.SUPABASE_URL}/auth/v1/recover"
+        if redirect_to:
+            url += f"?redirect_to={httpx.QueryParams({'redirect_to': redirect_to}).get('redirect_to')}"
         body = {
             "email": email
         }
@@ -113,32 +115,33 @@ class SupabaseAuthAPI:
 
     # Multi-Factor Authentication GoTrue HTTP calls
     async def mfa_enroll(self, token: str) -> dict:
-        url = f"{settings.SUPABASE_URL}/auth/v1/mfa/enroll"
+        url = f"{settings.SUPABASE_URL}/auth/v1/factors"
         body = {
             "factor_type": "totp",
             "friendly_name": "UniOS Authenticator"
         }
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=body, headers=self._get_headers(token))
-            if response.status_code != 200:
-                raise Exception(response.json().get("msg", "MFA enrollment failed"))
-            return response.json()
+            try:
+                data = response.json()
+            except Exception:
+                data = {"msg": response.text}
+            
+            if response.status_code not in (200, 201):
+                raise Exception(data.get("msg", data.get("error_description", f"MFA enrollment failed: {response.status_code} {response.text}")))
+            return data
 
     async def mfa_challenge(self, token: str, factor_id: str) -> dict:
-        url = f"{settings.SUPABASE_URL}/auth/v1/mfa/challenge"
-        body = {
-            "factor_id": factor_id
-        }
+        url = f"{settings.SUPABASE_URL}/auth/v1/factors/{factor_id}/challenge"
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=body, headers=self._get_headers(token))
+            response = await client.post(url, headers=self._get_headers(token))
             if response.status_code != 200:
                 raise Exception(response.json().get("msg", "MFA challenge failed"))
             return response.json()
 
     async def mfa_verify(self, token: str, factor_id: str, challenge_id: str, code: str) -> dict:
-        url = f"{settings.SUPABASE_URL}/auth/v1/mfa/verify"
+        url = f"{settings.SUPABASE_URL}/auth/v1/factors/{factor_id}/verify"
         body = {
-            "factor_id": factor_id,
             "challenge_id": challenge_id,
             "code": code
         }
@@ -160,6 +163,17 @@ class SupabaseAuthAPI:
             response = await client.post(url, json=body, headers=self._get_headers())
             if response.status_code != 200:
                 raise Exception(response.json().get("error_description", response.json().get("msg", "Code exchange failed")))
+            return response.json()
+
+    async def refresh_token(self, refresh_token: str) -> dict:
+        url = f"{settings.SUPABASE_URL}/auth/v1/token?grant_type=refresh_token"
+        body = {
+            "refresh_token": refresh_token
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=body, headers=self._get_headers())
+            if response.status_code != 200:
+                raise Exception(response.json().get("error_description", response.json().get("msg", "Token refresh failed")))
             return response.json()
 
 supabase_auth_api = SupabaseAuthAPI()
